@@ -691,14 +691,22 @@ func TestSmallTileSize(t *testing.T) {
 		tTileWidth:   uint32(1),
 		tTileLength:  uint32(0),
 	})
-	if _, err := Decode(bytes.NewReader(data)); err != FormatError("tile size is too small") {
-		t.Errorf("Decode of a 1x0 tile: got %v, want %v", err, FormatError("tile size is too small"))
+	// On a 32 bit platform the claimed 2^32-1 width does not fit in an int, so
+	// the image-size guard rejects the file before the tile-size guard is ever
+	// reached. Either rejection prevents the four billion tile iterations.
+	want := FormatError("tile size is too small")
+	if !intIs64Bit {
+		want = FormatError("image too large")
+	}
+	if _, err := Decode(bytes.NewReader(data)); err != want {
+		t.Errorf("Decode of a 1x0 tile: got %v, want %v", err, want)
 	}
 }
 
 // TestZeroHeightTiledImage tests that a tiled image of zero height, whose width
 // implies hundreds of millions of tiles across, still decodes to an empty image
-// and a nil error. Skipping the block loop entirely when there is no block to
+// and a nil error where its width is representable as an int, and is rejected
+// where it is not. Skipping the block loop entirely when there is no block to
 // read must not turn a zero-sized image into an error or a nil image.
 func TestZeroHeightTiledImage(t *testing.T) {
 	enc := binary.BigEndian
@@ -712,14 +720,25 @@ func TestZeroHeightTiledImage(t *testing.T) {
 	start := time.Now()
 	img, err := Decode(bytes.NewReader(data))
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if img == nil {
-		t.Fatal("Decode returned a nil image and a nil error")
-	}
-	if got := img.Bounds().Dy(); got != 0 {
-		t.Errorf("decoded image height is %d, want 0", got)
+	// Either outcome is checked before the shared timing assertion below: what
+	// this test is really about is that a zero-height image never walks its half
+	// a billion tile columns, which must hold on both int widths.
+	if !intIs64Bit {
+		// The 2^32-1 width does not fit in a 32 bit int, so the image-size guard
+		// refuses the file outright instead of decoding it to an empty image.
+		if want := FormatError("image too large"); err != want {
+			t.Fatalf("Decode: got %v, want %v", err, want)
+		}
+	} else {
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if img == nil {
+			t.Fatal("Decode returned a nil image and a nil error")
+		}
+		if got := img.Bounds().Dy(); got != 0 {
+			t.Errorf("decoded image height is %d, want 0", got)
+		}
 	}
 	// There are over half a billion tiles across, and none of them down. The
 	// block loop is skipped rather than walked over every column of an image
@@ -1186,5 +1205,169 @@ func TestBufferSliceBadInput(t *testing.T) {
 		if s != nil {
 			t.Errorf("buffer.Slice(%d, %d): got a %d byte slice, want nil", c.off, c.n, len(s))
 		}
+	}
+}
+
+// TestTileSizeError tests that a tile that is much larger than the image it is
+// claimed to tile is rejected. The tile is only a little wider than the 1024
+// pixels that legitimate images use, but a decoder that trusted it would size
+// its per-tile buffers from the tile rather than from the image.
+func TestTileSizeError(t *testing.T) {
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:                uint32(100),
+		tImageLength:               uint32(100),
+		tTileWidth:                 uint32(1024),
+		tTileLength:                uint32(1025),
+		tTileOffsets:               []uint32{8},
+		tTileByteCounts:            []uint32{0},
+		tPhotometricInterpretation: uint16(pBlackIsZero),
+		tBitsPerSample:             uint16(8),
+	})
+
+	_, err := Decode(bytes.NewReader(data))
+	if want := "tile size exceeds image size"; err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Decode: got %v, want error containing %q", err, want)
+	}
+}
+
+// TestHugeRowsPerStrip tests that a RowsPerStrip value far larger than the
+// height of the image is clamped to that height. The per-strip limit on
+// decompressed data is derived from the strip dimensions, so an unclamped
+// RowsPerStrip would raise that limit to a multiple of the real image size and
+// let a tiny strip inflate to gigabytes.
+func TestHugeRowsPerStrip(t *testing.T) {
+	// PackBits data that decodes to 640 bytes: each pair of bytes is a run of
+	// 128 copies of the second byte. An 8x8 8-bit image holds 64 bytes, so the
+	// limit derived from the strip is 8*8*8 = 512 bytes and the fifth run must
+	// push the output past it.
+	var packed []byte
+	for i := 0; i < 5; i++ {
+		packed = append(packed, 0x81, 0x00)
+	}
+
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	stripOffset := len(data)
+	data = append(data, packed...)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:                uint32(8),
+		tImageLength:               uint32(8),
+		tRowsPerStrip:              uint32(math.MaxUint32),
+		tStripOffsets:              []uint32{uint32(stripOffset)},
+		tStripByteCounts:           []uint32{uint32(len(packed))},
+		tCompression:               uint16(cPackBits),
+		tPhotometricInterpretation: uint16(pBlackIsZero),
+		tBitsPerSample:             uint16(8),
+	})
+
+	// Without the clamp the limit is 8*(2^32-1)*8 bytes, the data decodes
+	// without complaint and the image decodes successfully.
+	want := FormatError("PackBits: decompressed data too large")
+	if _, err := Decode(bytes.NewReader(data)); err != want {
+		t.Fatalf("Decode with a RowsPerStrip of 2^32-1: got %v, want %v", err, want)
+	}
+}
+
+// intIs64Bit reports whether the int type is 64 bits wide. The tests of the
+// size guards feed the decoder the largest dimension a TIFF file can express,
+// 2^32-1, which is representable as an int on a 64 bit platform but truncates to
+// a negative int on a 32 bit one. The malformed input is refused on both; only
+// which guard refuses it first, and therefore which FormatError comes back,
+// differs. Keeping that explicit lets the whole suite run under GOARCH=386,
+// where these int-width-sensitive guards are the ones actually being exercised.
+const intIs64Bit = ^uint(0)>>32 != 0
+
+// TestMul3 tests the overflow-safe multiplication that bounds the image and
+// tile dimensions. The dimensions read from a TIFF file are 32 bit, so the
+// products they form only overflow an int on a 32 bit platform, and the guards
+// in the decoder cannot be reached from Decode on a 64 bit one.
+func TestMul3(t *testing.T) {
+	for _, c := range []struct {
+		x, y, z int
+		want    int
+		wantOK  bool
+	}{
+		{0, 0, 0, 0, true},
+		{1, 2, 3, 6, true},
+		{1 << 10, 1 << 10, 8, 8 << 20, true},
+		// Negative inputs are never valid dimensions.
+		{-1, 1, 1, -1, false},
+		{1, -1, 1, -1, false},
+		{1, 1, -1, -1, false},
+		// Products that do not fit in an int. These use maxInt rather than
+		// math.MaxInt64 so that the inputs stay representable, and the
+		// products stay unrepresentable, on a 32 bit platform too.
+		{maxInt, maxInt, 1, -1, false},
+		{maxInt, 1, 2, -1, false},
+		{maxInt / 4, 2, 8, -1, false},
+	} {
+		got, ok := mul3(c.x, c.y, c.z)
+		if ok != c.wantOK {
+			t.Errorf("mul3(%d, %d, %d): got ok=%v, want %v", c.x, c.y, c.z, ok, c.wantOK)
+			continue
+		}
+		if ok && got != c.want {
+			t.Errorf("mul3(%d, %d, %d) = %d, want %d", c.x, c.y, c.z, got, c.want)
+		}
+		if !ok && got != -1 {
+			t.Errorf("mul3(%d, %d, %d) = %d on failure, want -1", c.x, c.y, c.z, got)
+		}
+	}
+}
+
+// TestImageTooLarge tests that an image whose dimensions are so large that the
+// number of bytes they need overflows an int is rejected. The dimensions are
+// 32 bit values, so their product with the 8 bytes per pixel assumed here
+// overflows even a 64 bit int.
+func TestImageTooLarge(t *testing.T) {
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:                uint32(math.MaxUint32),
+		tImageLength:               uint32(math.MaxUint32),
+		tPhotometricInterpretation: uint16(pBlackIsZero),
+		tBitsPerSample:             uint16(8),
+	})
+
+	// Without the check the decoder goes on to allocate an image of this size,
+	// which panics in makeslice instead of reporting a format error.
+	want := FormatError("image too large")
+	if _, err := DecodeConfig(bytes.NewReader(data)); err != want {
+		t.Fatalf("DecodeConfig of a 2^32-1 by 2^32-1 image: got %v, want %v", err, want)
+	}
+	if _, err := Decode(bytes.NewReader(data)); err != want {
+		t.Fatalf("Decode of a 2^32-1 by 2^32-1 image: got %v, want %v", err, want)
+	}
+}
+
+// TestTileTooLarge tests that a tile whose dimensions are so large that the
+// number of bytes they need overflows an int is rejected, rather than being
+// used to compute a per-tile data limit that overflows into a negative number.
+func TestTileTooLarge(t *testing.T) {
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:                uint32(100),
+		tImageLength:               uint32(100),
+		tTileWidth:                 uint32(math.MaxUint32),
+		tTileLength:                uint32(math.MaxUint32),
+		tTileOffsets:               []uint32{8},
+		tTileByteCounts:            []uint32{0},
+		tPhotometricInterpretation: uint16(pBlackIsZero),
+		tBitsPerSample:             uint16(8),
+	})
+
+	// On a 32 bit platform the 2^32-1 tile dimensions truncate to a negative
+	// int, which the "too small" guard catches first. Both guards refuse the
+	// tile before it can size a buffer, which is what the fix is for.
+	want := "tile size is too large"
+	if !intIs64Bit {
+		want = "tile size is too small"
+	}
+	_, err := Decode(bytes.NewReader(data))
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Decode: got %v, want error containing %q", err, want)
 	}
 }
